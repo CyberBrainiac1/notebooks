@@ -139,6 +139,32 @@ After training, you have 4 save options:
 - **Use**: Local inference on CPU/GPU
 - **Good for**: Desktop apps, offline use
 
+## ✅ After The Colab Run Finishes
+
+Use this checklist right after the notebook prints the final success message:
+
+1. **Verify outputs**
+   - You should see a folder like `pranav_assistant_lora/` in the Colab file browser.
+   - The test questions cell should print reasonable answers about Pranav.
+
+2. **Download your model**
+   - In the left sidebar, click the folder icon.
+   - Right-click `pranav_assistant_lora/` → **Download**.
+
+3. **Optional: Save to Google Drive**
+   - If your download is slow, save to Drive first, then download from Drive.
+
+4. **Optional: Export a GGUF file**
+   - If you want Ollama or LM Studio, run the GGUF export cell and download the `.gguf` file.
+
+5. **Keep your base model info**
+   - The LoRA adapter requires the base model `Llama 3.2 3B Instruct` at inference time.
+   - Write down the model name so you can reload it later.
+
+6. **Run a quick local test (example)**
+   - Load the adapter with Unsloth and ask a simple question.
+   - If it answers correctly, your training is good.
+
 ## 🚀 Using Your Trained Model
 
 ### In Python (with Unsloth):
