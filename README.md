@@ -15,6 +15,8 @@
 ## 📒 Fine-tuning Notebooks
 Below are our notebooks for Google Colab categorized by model. You can view our [Kaggle notebooks here](https://github.com/unslothai/notebooks/#-kaggle-notebooks).<br>Use our guided notebooks to prep data, train, evaluate, and save your model. View our main [GitHub repo here](https://github.com/unslothai/unsloth).
 
+Looking for a practical "what can I build?" guide: see [README_PRANAV.md](README_PRANAV.md).
+
 ### Main Notebooks
 
 | Model                      | Type           | Notebook Link                                                                                                                                                                                          |
