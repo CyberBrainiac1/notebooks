@@ -29,6 +29,12 @@ ollama pull nomic-embed-text
 
 Select your chat model when prompted.
 
+Windows one-click launcher:
+
+```powershell
+start_pranav_vector_memory_8b.bat
+```
+
 ## Commands
 
 - `/remember <fact>`: add a fact instantly to long-term memory
@@ -42,3 +48,14 @@ Select your chat model when prompted.
 - No repeated retraining loops
 - Updates instantly as you add/approve new information
 - Works well for personal profile knowledge and evolving project notes
+
+## One-Shot Full Bootstrap (No Questions Needed)
+
+This ingests all known profile datasets (`v4`, `full_training`, `v3`, `v2`, `qa`) into vector memory:
+
+```powershell
+.\.venv311\Scripts\python.exe scripts\bootstrap_pranav_memory.py `
+  --auto-start-ollama `
+  --auto-pull-embed-model `
+  --embed-model nomic-embed-text
+```

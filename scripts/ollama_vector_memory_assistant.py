@@ -51,9 +51,38 @@ Answer the user question about Pranav's profile using facts only.
 
 UNKNOWN_REPLY = "I do not have that detail in Pranav's saved profile yet."
 
+DEFAULT_SEED_DATASETS = [
+    Path("data/pranav_profile_qa_v4.jsonl"),
+    Path("data/pranav_full_training.jsonl"),
+    Path("data/pranav_profile_qa_v3.jsonl"),
+    Path("data/pranav_profile_qa_v2.jsonl"),
+    Path("data/pranav_profile_qa.jsonl"),
+]
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def resolve_model_name(requested: str, installed: Sequence[str]) -> Optional[str]:
+    req = requested.strip()
+    if not req:
+        return None
+    if req in installed:
+        return req
+
+    base = req.split(":", 1)[0].lower()
+    # Prefer :latest if present.
+    latest_name = f"{base}:latest"
+    for name in installed:
+        if name.lower() == latest_name:
+            return name
+
+    # Fall back to any installed tag matching the same base model.
+    for name in installed:
+        if name.split(":", 1)[0].lower() == base:
+            return name
+    return None
 
 
 def cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
@@ -349,7 +378,13 @@ class MemoryStore:
         new_contents: List[str] = []
         with dataset_path.open("r", encoding="utf-8") as f:
             for line in f:
-                row = json.loads(line)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
                 q = str(row.get("input", "")).strip()
                 a = str(row.get("output", "")).strip()
                 if not q or not a:
@@ -430,6 +465,29 @@ def ensure_base_dataset(path: Path) -> None:
     print(f"System: Built base dataset with {count} rows.")
 
 
+def gather_seed_datasets(
+    base_dataset: Path,
+    base_dataset_only: bool,
+    extra_seed_dataset: Sequence[str],
+) -> List[Path]:
+    candidates: List[Path] = [base_dataset]
+    if not base_dataset_only:
+        candidates.extend(DEFAULT_SEED_DATASETS)
+    candidates.extend(Path(x) for x in extra_seed_dataset if x.strip())
+
+    seen: set[str] = set()
+    out: List[Path] = []
+    for p in candidates:
+        rp = p.resolve() if p.exists() else p
+        key = str(rp).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if p.exists():
+            out.append(p)
+    return out
+
+
 def format_memory_context(
     store: MemoryStore,
     client: OllamaClient,
@@ -477,6 +535,23 @@ def parse_args() -> argparse.Namespace:
         help="Dataset used to seed initial memory facts.",
     )
     parser.add_argument(
+        "--base-dataset-only",
+        action="store_true",
+        help="Seed memory only from --base-dataset.",
+    )
+    parser.add_argument(
+        "--extra-seed-dataset",
+        action="append",
+        default=[],
+        help="Extra dataset JSONL path to ingest. Can be passed multiple times.",
+    )
+    parser.add_argument(
+        "--seed-batch-size",
+        type=int,
+        default=24,
+        help="Embedding batch size during memory seeding.",
+    )
+    parser.add_argument(
         "--runtime-dir",
         type=Path,
         default=Path("runtime/ollama_vector_memory"),
@@ -515,12 +590,14 @@ def main() -> None:
     client.ensure_running(auto_start=args.auto_start_ollama)
 
     models = client.list_models()
-    if args.embed_model not in models and args.auto_pull_embed_model:
+    embed_model = resolve_model_name(args.embed_model, models)
+    if embed_model is None and args.auto_pull_embed_model:
         print(f"System: pulling embedding model `{args.embed_model}` ...")
         client.pull_model(args.embed_model)
         models = client.list_models()
+        embed_model = resolve_model_name(args.embed_model, models)
 
-    if args.embed_model not in models:
+    if embed_model is None:
         raise RuntimeError(
             f"Embedding model `{args.embed_model}` not found.\n"
             f"Run: ollama pull {args.embed_model}"
@@ -528,34 +605,47 @@ def main() -> None:
 
     chat_model = args.chat_model.strip()
     if chat_model:
-        if chat_model not in models and args.auto_pull_chat_model:
+        resolved_chat = resolve_model_name(chat_model, models)
+        if resolved_chat is None and args.auto_pull_chat_model:
             print(f"System: pulling chat model `{chat_model}` ...")
             client.pull_model(chat_model)
             models = client.list_models()
-        if chat_model not in models:
+            resolved_chat = resolve_model_name(chat_model, models)
+        if resolved_chat is None:
             raise RuntimeError(
                 f"Chat model `{chat_model}` not found.\n"
                 f"Run: ollama pull {chat_model}"
             )
+        chat_model = resolved_chat
     else:
         chat_model = choose_chat_model(client)
     store = MemoryStore(args.runtime_dir / "memory.db")
     interaction_log = args.runtime_dir / "interactions.jsonl"
     interaction_log.parent.mkdir(parents=True, exist_ok=True)
 
-    print("System: seeding vector memory from base dataset...")
-    seeded = store.seed_from_dataset(
-        dataset_path=args.base_dataset,
-        embed_fn=lambda texts: client.embed_texts(args.embed_model, texts),
+    seed_paths = gather_seed_datasets(
+        base_dataset=args.base_dataset,
+        base_dataset_only=args.base_dataset_only,
+        extra_seed_dataset=args.extra_seed_dataset,
     )
+    print("System: seeding vector memory from datasets...")
+    seeded_total = 0
+    for dataset_path in seed_paths:
+        added = store.seed_from_dataset(
+            dataset_path=dataset_path,
+            embed_fn=lambda texts: client.embed_texts(embed_model, texts),
+            batch_size=max(1, args.seed_batch_size),
+        )
+        seeded_total += added
+        print(f"System: {dataset_path} -> added {added} memories")
     print(
-        f"System: seed complete (added={seeded}, total_memories={store.memory_count()})."
+        f"System: seed complete (added_total={seeded_total}, total_memories={store.memory_count()})."
     )
 
     print(
         "\nVector Memory Assistant ready.\n"
         f"Live model: {chat_model}\n"
-        f"Embedding model: {args.embed_model}\n"
+        f"Embedding model: {embed_model}\n"
         "Commands:\n"
         "  /remember <fact>  -> store a new fact directly in vector memory\n"
         "  /stats            -> show counts\n"
@@ -575,7 +665,7 @@ def main() -> None:
             if not fact:
                 print("System: usage -> /remember <fact>")
                 continue
-            emb = client.embed_texts(args.embed_model, [fact])[0]
+            emb = client.embed_texts(embed_model, [fact])[0]
             added = store.add_memory(content=fact, embedding=emb, source="manual")
             print("System: memory saved." if added else "System: memory already exists.")
             continue
@@ -586,7 +676,7 @@ def main() -> None:
             )
             continue
         if user_input == "/model":
-            print(f"System: chat_model={chat_model}, embed_model={args.embed_model}")
+            print(f"System: chat_model={chat_model}, embed_model={embed_model}")
             continue
         if user_input == "/help":
             print(
@@ -598,7 +688,7 @@ def main() -> None:
             memory_context = format_memory_context(
                 store=store,
                 client=client,
-                embed_model=args.embed_model,
+                embed_model=embed_model,
                 user_input=user_input,
                 top_k=args.memory_top_k,
                 scan_limit=args.memory_scan_limit,
@@ -660,7 +750,7 @@ def main() -> None:
         if q_score >= args.min_quality:
             memory_text = f"Q: {user_input} | A: {reply}"
             try:
-                emb = client.embed_texts(args.embed_model, [memory_text])[0]
+                emb = client.embed_texts(embed_model, [memory_text])[0]
                 store.add_memory(
                     content=memory_text,
                     embedding=emb,
