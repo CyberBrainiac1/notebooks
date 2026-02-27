@@ -49,6 +49,7 @@ If Unsloth import issues appear, check the Known Issues section in `README.md` (
 Recommended stronger run:
 
 - `--max-steps 600` for better memory of profile details.
+- Add `--save-merged-16bit` if you want to export directly to Ollama later.
 
 ## 4) Chat with Your Model
 
@@ -57,6 +58,28 @@ Recommended stronger run:
 ```
 
 Type `exit` to quit.
+
+## 5) Make It Work In Ollama (One Command)
+
+If you finished training and have a merged model (`.safetensors`) available, run:
+
+```powershell
+.\.venv311\Scripts\python.exe scripts/setup_pranav_ollama.py --model-name pranav-assistant
+```
+
+Then chat with it:
+
+```powershell
+ollama run pranav-assistant
+```
+
+Notes:
+
+- Script auto-detects merged model folders from:
+  - `outputs/pranav_gguf`
+  - `outputs/pranav_8gb/pranav_merged_16bit`
+  - `outputs/pranav_8gb/pranav_merged`
+- It converts to GGUF, writes a Modelfile, and runs `ollama create --quantize q4_K_M`.
 
 ## Notes
 
