@@ -5,6 +5,7 @@ This repo includes many ready-to-run notebooks for fine-tuning and inference acr
 If you want a personal profile model that runs on an 8GB GPU, use [README_PRANAV_MODEL_8GB.md](README_PRANAV_MODEL_8GB.md).
 If you want automatic memory + auto-retraining from new interactions, use [README_PRANAV_SELF_LEARNING.md](README_PRANAV_SELF_LEARNING.md).
 If you want Ollama-first autopilot (select model once, then automatic memory + retraining), use [README_PRANAV_OLLAMA_AUTOPILOT.md](README_PRANAV_OLLAMA_AUTOPILOT.md).
+If you want no-retrain vector memory (recommended for fast profile learning), use [README_PRANAV_VECTOR_MEMORY.md](README_PRANAV_VECTOR_MEMORY.md).
 
 ## What You Can Build
 
