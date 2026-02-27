@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 from pathlib import Path
 from typing import Dict, List
 
@@ -14,6 +15,7 @@ INSTRUCTION_POOL = [
     "Answer using only Pranav's saved profile facts. If unknown, say you do not have that detail.",
     "You are a profile assistant for Pranav Emmadi. Be concise, factual, and avoid making up details.",
     "Respond with profile-grounded information only. Do not invent personal data.",
+    "Handle misspellings and text-message style questions while staying factual to saved profile data.",
 ]
 
 
@@ -145,6 +147,25 @@ QA_BANK: List[Dict[str, object]] = [
     },
     {
         "questions": [
+            "Is BTS7960 the motor or the driver in his wheel stack?",
+            "Clarify driver vs motor in his setup.",
+            "When asked motor driver, what exact part name is correct?",
+        ],
+        "answer": (
+            "BTS7960 is the motor driver module. The motors are separate 12V brushed planetary gearmotors."
+        ),
+    },
+    {
+        "questions": [
+            "What motor type does he use with the BTS7960?",
+            "What motors are paired with that driver?",
+        ],
+        "answer": (
+            "He uses 12V brushed DC planetary gearmotors around the 312 RPM output class."
+        ),
+    },
+    {
+        "questions": [
             "What encoder type is in his wheel stack?",
             "What type of encoder does he use?",
         ],
@@ -155,7 +176,17 @@ QA_BANK: List[Dict[str, object]] = [
             "What is his locked-in encoder rule?",
             "How does he define CPR from PPR?",
         ],
-        "answer": "He explicitly uses CPR = PPR x 4 for quadrature decoding.",
+        "answer": (
+            "He explicitly uses CPR = PPR x 4 for quadrature decoding, not CPR = PPR x 4/3."
+        ),
+    },
+    {
+        "questions": [
+            "Is his CPR rule divided by 3?",
+            "Does he use CPR = PPR x 4 or x 4/3?",
+            "What is the exact CPR formula he uses?",
+        ],
+        "answer": "His exact rule is CPR = PPR x 4.",
     },
     {
         "questions": [
@@ -367,6 +398,81 @@ LONG_FORM_TASKS = [
 ]
 
 
+SMS_MAP = {
+    "what": "wat",
+    "which": "wich",
+    "where": "wer",
+    "is": "iz",
+    "are": "r",
+    "you": "u",
+    "your": "ur",
+    "team": "teem",
+    "name": "nme",
+    "preferred": "preferrd",
+    "software": "softwere",
+    "based": "basd",
+    "birthday": "bday",
+    "microcontroller": "microcntroler",
+    "wheel": "weel",
+}
+
+TOKEN_RE = re.compile(r"[A-Za-z0-9']+|[^A-Za-z0-9']+")
+
+
+def _swap_adjacent(text: str, rng: random.Random) -> str:
+    letters = [i for i, c in enumerate(text) if c.isalpha()]
+    if len(letters) < 2:
+        return text
+    i = rng.choice(letters[:-1])
+    chars = list(text)
+    chars[i], chars[i + 1] = chars[i + 1], chars[i]
+    return "".join(chars)
+
+
+def _drop_vowel(text: str, rng: random.Random) -> str:
+    idx = [i for i, c in enumerate(text) if c.lower() in "aeiou" and i > 0]
+    if not idx:
+        return text
+    i = rng.choice(idx)
+    return text[:i] + text[i + 1 :]
+
+
+def _duplicate_letter(text: str, rng: random.Random) -> str:
+    idx = [i for i, c in enumerate(text) if c.isalpha()]
+    if not idx:
+        return text
+    i = rng.choice(idx)
+    return text[: i + 1] + text[i] + text[i + 1 :]
+
+
+def make_typo_token(token: str, rng: random.Random) -> str:
+    if len(token) < 4 or not token.isalpha():
+        return token
+    op = rng.choice([_swap_adjacent, _drop_vowel, _duplicate_letter])
+    return op(token, rng)
+
+
+def to_sms_variant(question: str, rng: random.Random) -> str:
+    out: List[str] = []
+    for part in TOKEN_RE.findall(question):
+        if re.fullmatch(r"[A-Za-z0-9']+", part):
+            lower = part.lower()
+            repl = SMS_MAP.get(lower, lower)
+            if rng.random() < 0.25:
+                repl = make_typo_token(repl, rng)
+            out.append(repl)
+        else:
+            out.append(part)
+    return "".join(out).strip().rstrip("?")
+
+
+def noisy_variants(question: str, rng: random.Random, count: int = 2) -> List[str]:
+    variants = set()
+    for _ in range(count):
+        variants.add(to_sms_variant(question, rng))
+    return [v for v in variants if v and v.lower() != question.lower()]
+
+
 def build_examples(seed: int = 3407) -> List[Dict[str, str]]:
     rng = random.Random(seed)
     examples: List[Dict[str, str]] = []
@@ -375,11 +481,13 @@ def build_examples(seed: int = 3407) -> List[Dict[str, str]]:
         questions = item["questions"]
         answer = str(item["answer"])
         for question in questions:
-            variants = [
+            variants = {
                 str(question),
                 f"Profile check: {question}",
                 f"In Pranav's saved profile, {str(question).lower()}",
-            ]
+            }
+            for noisy in noisy_variants(str(question), rng, count=2):
+                variants.add(noisy)
             for variant in variants:
                 examples.append(
                     {
@@ -390,13 +498,17 @@ def build_examples(seed: int = 3407) -> List[Dict[str, str]]:
                 )
 
     for question in UNKNOWN_QUESTIONS:
-        examples.append(
-            {
-                "instruction": rng.choice(INSTRUCTION_POOL),
-                "input": question,
-                "output": UNKNOWN_OUTPUT,
-            }
-        )
+        unknown_variants = {question}
+        for noisy in noisy_variants(question, rng, count=2):
+            unknown_variants.add(noisy)
+        for variant in unknown_variants:
+            examples.append(
+                {
+                    "instruction": rng.choice(INSTRUCTION_POOL),
+                    "input": variant,
+                    "output": UNKNOWN_OUTPUT,
+                }
+            )
 
     examples.extend(LONG_FORM_TASKS)
     rng.shuffle(examples)

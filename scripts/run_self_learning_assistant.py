@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Ollama-first self-learning assistant with automatic background retraining."""
+"""Run PranavProfileGPT with automatic memory + logging + retraining loop."""
 
 from __future__ import annotations
 
@@ -8,22 +8,27 @@ import json
 import os
 import queue
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
-import urllib.request
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
-try:
-    from build_pranav_profile_dataset import build_and_write_dataset
-except ModuleNotFoundError:
-    from scripts.build_pranav_profile_dataset import build_and_write_dataset
+os.environ.setdefault("UNSLOTH_SKIP_TORCHVISION_CHECK", "1")
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
+import torch
+from unsloth import FastLanguageModel
 
 
 SYSTEM_PROMPT = (
@@ -53,126 +58,6 @@ Answer the user question about Pranav's profile using facts only.
 TOKEN_RE = re.compile(r"[a-z0-9_]+")
 
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def sanitize_model_slug(name: str) -> str:
-    slug = re.sub(r"[^a-zA-Z0-9]+", "-", name).strip("-").lower()
-    return slug[:48] if slug else "model"
-
-
-def model_to_unsloth(model_name: str) -> Optional[str]:
-    n = model_name.lower()
-    if n.startswith("llama3.2:1b"):
-        return "unsloth/Llama-3.2-1B-Instruct-bnb-4bit"
-    if n.startswith("llama3.2:3b") or n == "llama3.2":
-        return "unsloth/Llama-3.2-3B-Instruct-bnb-4bit"
-    return None
-
-
-class OllamaClient:
-    def __init__(self, host: str = "http://127.0.0.1:11434", timeout: int = 15) -> None:
-        self.host = host.rstrip("/")
-        self.timeout = timeout
-        self._serve_proc: Optional[subprocess.Popen] = None
-
-    def _request_json(self, path: str, payload: Optional[Dict] = None) -> Dict:
-        url = f"{self.host}{path}"
-        if payload is None:
-            req = urllib.request.Request(url=url, method="GET")
-        else:
-            data = json.dumps(payload).encode("utf-8")
-            req = urllib.request.Request(
-                url=url,
-                method="POST",
-                data=data,
-                headers={"Content-Type": "application/json"},
-            )
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-
-    def is_running(self) -> bool:
-        try:
-            self._request_json("/api/tags")
-            return True
-        except Exception:  # noqa: BLE001
-            return False
-
-    def ensure_running(self, auto_start: bool = True) -> None:
-        if self.is_running():
-            return
-        if not auto_start:
-            raise RuntimeError(
-                "Ollama is not running. Start it first (`ollama serve`) and retry."
-            )
-        print("System: Ollama is not running. Starting `ollama serve`...")
-        self._serve_proc = subprocess.Popen(
-            ["ollama", "serve"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
-        )
-        for _ in range(25):
-            time.sleep(0.8)
-            if self.is_running():
-                print("System: Ollama server started.")
-                return
-        raise RuntimeError(
-            "Failed to start Ollama automatically. Start it manually with `ollama serve`."
-        )
-
-    def list_models(self) -> List[str]:
-        data = self._request_json("/api/tags")
-        models = data.get("models", [])
-        return [m.get("name", "") for m in models if m.get("name")]
-
-    def generate(
-        self,
-        model: str,
-        prompt: str,
-        max_new_tokens: int = 220,
-        temperature: float = 0.3,
-        top_p: float = 0.9,
-    ) -> str:
-        data = self._request_json(
-            "/api/generate",
-            payload={
-                "model": model,
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "num_predict": max_new_tokens,
-                    "temperature": temperature,
-                    "top_p": top_p,
-                },
-            },
-        )
-        return str(data.get("response", "")).strip()
-
-    def create_model_from_modelfile(
-        self,
-        model_name: str,
-        modelfile: Path,
-        quantize: Optional[str] = None,
-    ) -> bool:
-        cmd = ["ollama", "create", model_name, "-f", str(modelfile)]
-        if quantize:
-            cmd += ["--quantize", quantize]
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        if proc.returncode != 0:
-            print("[AutoTrain] `ollama create` failed:\n" + proc.stdout)
-            return False
-        return True
-
-
 @dataclass
 class Interaction:
     uid: str
@@ -182,10 +67,12 @@ class Interaction:
     memory_context: str
     quality_score: float
     approved: bool
-    source_model: str
+    source_adapter: str
 
 
 class MemoryStore:
+    """Simple SQLite memory store with token-overlap retrieval."""
+
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -208,7 +95,7 @@ class MemoryStore:
                     memory_context TEXT NOT NULL,
                     quality_score REAL NOT NULL,
                     approved INTEGER NOT NULL,
-                    source_model TEXT NOT NULL
+                    source_adapter TEXT NOT NULL
                 );
                 """
             )
@@ -230,7 +117,7 @@ class MemoryStore:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO interactions
-                (id, ts, user_input, model_output, memory_context, quality_score, approved, source_model)
+                (id, ts, user_input, model_output, memory_context, quality_score, approved, source_adapter)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
@@ -241,7 +128,7 @@ class MemoryStore:
                     row.memory_context,
                     row.quality_score,
                     1 if row.approved else 0,
-                    row.source_model,
+                    row.source_adapter,
                 ),
             )
             conn.commit()
@@ -258,7 +145,6 @@ class MemoryStore:
             ).fetchone()
             if row is None:
                 return False
-
             conn.execute(
                 """
                 UPDATE interactions
@@ -291,7 +177,11 @@ class MemoryStore:
             if row is None:
                 return False
             conn.execute(
-                "UPDATE interactions SET approved = 0, quality_score = 0.0 WHERE id = ?",
+                """
+                UPDATE interactions
+                SET approved = 0, quality_score = 0.0
+                WHERE id = ?
+                """,
                 (row["id"],),
             )
             conn.execute("DELETE FROM train_promoted WHERE id = ?", (row["id"],))
@@ -324,10 +214,14 @@ class MemoryStore:
             return list(rows)
 
     def build_auto_dataset(
-        self, base_dataset: Path, output_dataset: Path, min_quality: float
+        self,
+        base_dataset: Path,
+        output_dataset: Path,
+        min_quality: float,
     ) -> int:
         output_dataset.parent.mkdir(parents=True, exist_ok=True)
         merged: List[Dict[str, str]] = []
+
         with base_dataset.open("r", encoding="utf-8") as f:
             for line in f:
                 merged.append(json.loads(line))
@@ -353,25 +247,10 @@ class MemoryStore:
             )
 
         with output_dataset.open("w", encoding="utf-8") as f:
-            for row in merged:
-                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            for item in merged:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
         return len(rows)
-
-
-class ModelState:
-    def __init__(self, model_name: str) -> None:
-        self._model_name = model_name
-        self._version = 0
-        self._lock = threading.Lock()
-
-    def get(self) -> Tuple[str, int]:
-        with self._lock:
-            return self._model_name, self._version
-
-    def set(self, model_name: str) -> None:
-        with self._lock:
-            self._model_name = model_name
-            self._version += 1
 
 
 def tokenize(text: str) -> List[str]:
@@ -390,7 +269,9 @@ def retrieval_score(query_tokens: Sequence[str], candidate_tokens: Sequence[str]
 
 
 def select_memory_context(
-    user_input: str, memory_rows: Sequence[sqlite3.Row], top_k: int = 5
+    user_input: str,
+    memory_rows: Sequence[sqlite3.Row],
+    top_k: int = 5,
 ) -> str:
     q_tokens = tokenize(user_input)
     scored: List[Tuple[float, sqlite3.Row]] = []
@@ -403,10 +284,12 @@ def select_memory_context(
     best = scored[:top_k]
     if not best:
         return "- No relevant prior memory found."
-    out: List[str] = []
+    lines = []
     for idx, (_, row) in enumerate(best, start=1):
-        out.append(f"- Memory {idx}: Q: {row['user_input']} | A: {row['model_output']}")
-    return "\n".join(out)
+        lines.append(
+            f"- Memory {idx}: Q: {row['user_input']} | A: {row['model_output']}"
+        )
+    return "\n".join(lines)
 
 
 def quality_heuristic(user_input: str, model_output: str) -> float:
@@ -435,43 +318,24 @@ def quality_heuristic(user_input: str, model_output: str) -> float:
         ]
     ):
         score += 0.15
+    if "http" in text and "linkedin.com/in/pranav-emmadi-874723399" not in text:
+        score -= 0.2
     if len(user_input.strip()) < 3:
         score = min(score, 0.4)
     return max(0.0, min(1.0, score))
 
 
-def write_interaction_jsonl(log_path: Path, row: Interaction) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", encoding="utf-8") as f:
-        f.write(
-            json.dumps(
-                {
-                    "id": row.uid,
-                    "ts": row.ts,
-                    "input": row.user_input,
-                    "output": row.model_output,
-                    "quality_score": row.quality_score,
-                    "approved": row.approved,
-                    "source_model": row.source_model,
-                    "memory_context": row.memory_context,
-                },
-                ensure_ascii=False,
-            )
-            + "\n"
-        )
-
-
-def run_eval_ollama(client: OllamaClient, model_name: str, min_pass: int = 7) -> bool:
+def run_eval(adapter_dir: Path) -> bool:
+    # Lightweight keyword-based smoke test before rollout.
     def check_terms(text: str, terms: Sequence[str]) -> bool:
         low = text.lower()
-        return all(t in low for t in terms)
+        return all(term in low for term in terms)
 
     def check_bts7960(text: str) -> bool:
         low = text.lower()
         if "bts7960" not in low:
             return False
-        banned = ["bts73", "bts78", "bts 73", "bts 78"]
-        return not any(b in low for b in banned)
+        return not any(x in low for x in ["bts73", "bts78", "bts 73", "bts 78"])
 
     def check_cpr_formula(text: str) -> bool:
         low = text.lower()
@@ -480,88 +344,81 @@ def run_eval_ollama(client: OllamaClient, model_name: str, min_pass: int = 7) ->
         has_x4 = any(token in low for token in ["x 4", "x4", "* 4", "*4"])
         if not has_x4:
             return False
-        banned = ["4/3", "x 4/3", "x4/3", "*4/3"]
-        return not any(b in low for b in banned)
+        return not any(x in low for x in ["4/3", "x 4/3", "x4/3", "*4/3"])
 
     tests = [
         ("What FTC team is Pranav on?", lambda t: check_terms(t, ["evergreen dragons"])),
         ("What is his preferred name?", lambda t: check_terms(t, ["superman"])),
         ("What CAD software does he use?", lambda t: check_terms(t, ["solidworks", "onshape"])),
         ("What motor driver does his wheel use?", check_bts7960),
-        ("wat motr drivr does his weel use", check_bts7960),
         ("How does he define CPR from PPR?", check_cpr_formula),
-        ("how he defne cpr frm ppr", check_cpr_formula),
         ("What is his birthday?", lambda t: check_terms(t, ["do not have that detail"])),
     ]
-    passed = 0
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=str(adapter_dir),
+        max_seq_length=1024,
+        dtype=None,
+        load_in_4bit=True,
+    )
+    FastLanguageModel.for_inference(model)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    passes = 0
     for question, validator in tests:
         prompt = PROMPT_TEMPLATE.format(
             system_prompt=SYSTEM_PROMPT,
             memory_block="- No relevant prior memory found.",
             user_input=question,
         )
-        try:
-            out = client.generate(
-                model=model_name,
-                prompt=prompt,
-                max_new_tokens=160,
-                temperature=0.2,
-                top_p=0.9,
-            ).lower()
-        except Exception:  # noqa: BLE001
-            return False
-        if validator(out):
-            passed += 1
-    return passed >= min_pass
+        inputs = tokenizer([prompt], return_tensors="pt").to(device)
+        output = model.generate(
+            **inputs,
+            max_new_tokens=120,
+            temperature=0.2,
+            top_p=0.9,
+            use_cache=True,
+        )
+        text = tokenizer.batch_decode(output)[0].lower()
+        if validator(text):
+            passes += 1
+
+    return passes >= 5
 
 
-class AutoTrainer:
+class SelfTrainer:
+    """Background retraining loop."""
+
     def __init__(
         self,
-        client: OllamaClient,
-        model_state: ModelState,
         python_exe: str,
         train_script: Path,
         base_dataset: Path,
         auto_dataset: Path,
-        runtime_dir: Path,
         outputs_root: Path,
-        base_ollama_model: str,
-        unsloth_model_name: str,
-        setup_script: Path,
-        quantize: str,
-        eval_min_pass: int,
+        runtime_dir: Path,
         min_quality: float,
         retrain_every: int,
         train_steps: int,
     ) -> None:
-        self.client = client
-        self.model_state = model_state
         self.python_exe = python_exe
         self.train_script = train_script
         self.base_dataset = base_dataset
         self.auto_dataset = auto_dataset
-        self.runtime_dir = runtime_dir
         self.outputs_root = outputs_root
-        self.base_ollama_model = base_ollama_model
-        self.unsloth_model_name = unsloth_model_name
-        self.setup_script = setup_script
-        self.quantize = quantize
-        self.eval_min_pass = eval_min_pass
+        self.stage_output = outputs_root / "auto_stage"
+        self.prod_output = outputs_root / "pranav_8gb"
+        self.runtime_dir = runtime_dir
+        self.runtime_dir.mkdir(parents=True, exist_ok=True)
         self.min_quality = min_quality
         self.retrain_every = retrain_every
         self.train_steps = train_steps
-
-        self.stage_output = self.outputs_root / "ollama_auto_stage"
-        slug = sanitize_model_slug(base_ollama_model)
-        self.deploy_model_name = f"pranav-auto-{slug}"
-
-        self.store: Optional[MemoryStore] = None
-        self.last_trained_candidate_count = 0
         self.training_lock = threading.Lock()
+        self.pending_requests = queue.Queue()
+        self.last_trained_candidate_count = 0
         self.stop_event = threading.Event()
-        self.pending_requests: queue.Queue[str] = queue.Queue()
         self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.store: MemoryStore | None = None
+        self._promotion_version = 0
 
     def attach_store(self, store: MemoryStore) -> None:
         self.store = store
@@ -576,6 +433,10 @@ class AutoTrainer:
 
     def notify_new_data(self) -> None:
         self.pending_requests.put("new_data")
+
+    @property
+    def promotion_version(self) -> int:
+        return self._promotion_version
 
     def _loop(self) -> None:
         while not self.stop_event.is_set():
@@ -603,7 +464,7 @@ class AutoTrainer:
             )
             print(
                 f"\n[AutoTrain] Triggered with {added} promoted interactions "
-                f"(delta={delta}). Starting retrain..."
+                f"(delta={delta}). Starting background training..."
             )
 
             cmd = [
@@ -614,170 +475,115 @@ class AutoTrainer:
                 "--output-dir",
                 str(self.stage_output),
                 "--model-name",
-                self.unsloth_model_name,
+                "unsloth/Llama-3.2-1B-Instruct-bnb-4bit",
                 "--max-seq-length",
                 "1024",
                 "--batch-size",
                 "1",
                 "--grad-accum",
                 "8",
+                "--max-steps",
+                str(self.train_steps),
                 "--learning-rate",
-                "1.5e-4",
-                "--save-merged-16bit",
+                "2e-4",
             ]
-            if self.train_steps > 0:
-                cmd += ["--max-steps", str(self.train_steps)]
-            else:
-                cmd += [
-                    "--max-steps",
-                    "0",
-                    "--auto-max-steps",
-                    "--target-epochs",
-                    "2.8",
-                    "--min-steps",
-                    "100",
-                    "--max-steps-cap",
-                    "420",
-                ]
 
             env = os.environ.copy()
             env["UNSLOTH_SKIP_TORCHVISION_CHECK"] = "1"
             proc = subprocess.run(cmd, cwd=str(Path.cwd()), env=env)
             if proc.returncode != 0:
-                print("[AutoTrain] Training failed. Keeping current model.")
+                print("[AutoTrain] Training failed. Keeping current production model.")
                 return
 
             stage_adapter = self.stage_output / "pranav_lora"
+            prod_adapter = self.prod_output / "pranav_lora"
             if not stage_adapter.exists():
                 print("[AutoTrain] Stage adapter missing after training.")
                 return
 
-            stage_merged = self.stage_output / "pranav_merged_16bit"
-            if not stage_merged.exists():
-                print("[AutoTrain] Stage merged model missing after training.")
-                return
-            if not self.setup_script.exists():
-                print(f"[AutoTrain] Setup script not found: {self.setup_script}")
+            print("[AutoTrain] Running post-train evaluation...")
+            try:
+                passed = run_eval(stage_adapter)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[AutoTrain] Eval failed with error: {exc}")
+                passed = False
+
+            if not passed:
+                print("[AutoTrain] Eval gate failed. Model not promoted.")
                 return
 
-            build_cmd = [
-                self.python_exe,
-                str(self.setup_script),
-                "--input-dir",
-                str(stage_merged),
-                "--model-name",
-                self.deploy_model_name,
-                "--quantize",
-                self.quantize,
-                "--python-exe",
-                self.python_exe,
-            ]
-            print(f"[AutoTrain] Building Ollama model `{self.deploy_model_name}` ...")
-            proc = subprocess.run(
-                build_cmd,
-                cwd=str(Path.cwd()),
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
-            if proc.returncode != 0:
-                print("[AutoTrain] Ollama model build failed:\n" + proc.stdout)
-                return
+            backup_root = self.runtime_dir / "backups"
+            backup_root.mkdir(parents=True, exist_ok=True)
+            backup_dir = backup_root / f"pranav_lora_{int(time.time())}"
+            if prod_adapter.exists():
+                shutil.copytree(prod_adapter, backup_dir, dirs_exist_ok=True)
 
-            print("[AutoTrain] Running eval gate...")
-            if not run_eval_ollama(
-                self.client, self.deploy_model_name, min_pass=self.eval_min_pass
-            ):
-                print("[AutoTrain] Eval gate failed. Keeping current model.")
-                return
+            prod_adapter.parent.mkdir(parents=True, exist_ok=True)
+            shutil.rmtree(prod_adapter, ignore_errors=True)
+            shutil.copytree(stage_adapter, prod_adapter)
 
-            self.model_state.set(self.deploy_model_name)
             self.last_trained_candidate_count = candidate_count
-            print(
-                f"[AutoTrain] Promotion complete. Live model switched to `{self.deploy_model_name}`."
-            )
+            self._promotion_version += 1
+            print("[AutoTrain] Promotion complete. New model is now live.")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Ollama autopilot: model select + chat + auto-train + auto-rollout."
+        description="Run self-learning Pranav profile assistant."
     )
     parser.add_argument(
-        "--host",
-        type=str,
-        default="http://127.0.0.1:11434",
-        help="Ollama API host.",
+        "--adapter-dir",
+        type=Path,
+        default=Path("outputs/pranav_8gb/pranav_lora"),
+        help="Current production adapter dir.",
     )
     parser.add_argument(
         "--base-dataset",
         type=Path,
         default=Path("data/pranav_profile_qa.jsonl"),
-        help="Base dataset path.",
+        help="Base profile dataset path.",
     )
     parser.add_argument(
         "--runtime-dir",
         type=Path,
-        default=Path("runtime/ollama_autopilot"),
-        help="Runtime directory for logs, DB, and Modelfiles.",
+        default=Path("runtime/self_learning"),
+        help="Runtime directory for DB/logs/backups.",
     )
     parser.add_argument(
         "--python-exe",
         type=str,
-        default=str(Path(".venv311/Scripts/python.exe"))
-        if Path(".venv311/Scripts/python.exe").exists()
-        else sys.executable,
-        help="Python executable used for background retraining.",
+        default=sys.executable,
+        help="Python executable used for auto-retraining subprocess.",
     )
     parser.add_argument(
         "--train-script",
         type=Path,
         default=Path("scripts/train_pranav_8gb.py"),
-        help="Retraining script path.",
-    )
-    parser.add_argument(
-        "--setup-script",
-        type=Path,
-        default=Path("scripts/setup_pranav_ollama.py"),
-        help="Script used to convert merged model and register in Ollama.",
+        help="Training script path for background retraining.",
     )
     parser.add_argument(
         "--min-quality",
         type=float,
-        default=0.90,
-        help="Auto-promotion quality threshold.",
+        default=0.85,
+        help="Minimum quality score for auto-promotion to training candidates.",
     )
     parser.add_argument(
         "--retrain-every",
         type=int,
-        default=40,
-        help="Retrain after this many new promoted interactions.",
+        default=25,
+        help="Trigger retrain after this many newly promoted interactions.",
     )
     parser.add_argument(
         "--train-steps",
         type=int,
-        default=0,
-        help="Background retraining steps per cycle. Use 0 for auto sizing.",
-    )
-    parser.add_argument(
-        "--quantize",
-        type=str,
-        default="q4_K_M",
-        help="Quantization used for auto-created Ollama rollouts.",
-    )
-    parser.add_argument(
-        "--eval-min-pass",
-        type=int,
-        default=7,
-        help="Minimum number of evaluation checks required to promote a retrained model.",
+        default=120,
+        help="Background auto-train steps per cycle.",
     )
     parser.add_argument(
         "--memory-top-k",
         type=int,
         default=5,
-        help="Retrieved memory snippets injected per prompt.",
+        help="How many memories to inject into prompt.",
     )
     parser.add_argument(
         "--max-new-tokens",
@@ -785,73 +591,62 @@ def parse_args() -> argparse.Namespace:
         default=220,
         help="Generation max new tokens.",
     )
-    parser.add_argument(
-        "--auto-start-ollama",
-        action="store_true",
-        help="Auto-start Ollama server if not running.",
-    )
     return parser.parse_args()
 
 
-def choose_supported_model(client: OllamaClient) -> str:
-    models = client.list_models()
-    supported = [m for m in models if model_to_unsloth(m) is not None]
-    if not supported:
-        raise RuntimeError(
-            "No supported Ollama model found.\n"
-            "Install one with: ollama pull llama3.2:1b"
+def write_interaction_jsonl(log_path: Path, row: Interaction) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(
+            json.dumps(
+                {
+                    "id": row.uid,
+                    "ts": row.ts,
+                    "input": row.user_input,
+                    "output": row.model_output,
+                    "quality_score": row.quality_score,
+                    "approved": row.approved,
+                    "source_adapter": row.source_adapter,
+                    "memory_context": row.memory_context,
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
         )
-    print("\nSelect an Ollama model for autopilot training:")
-    for idx, name in enumerate(supported, start=1):
-        print(f"  {idx}. {name}")
-    while True:
-        pick = input("Model number: ").strip()
-        if pick.isdigit():
-            i = int(pick)
-            if 1 <= i <= len(supported):
-                return supported[i - 1]
-        print("Invalid selection. Try again.")
 
 
-def ensure_base_dataset(path: Path) -> None:
-    if path.exists():
-        return
-    print(f"System: Base dataset missing at {path}. Building default dataset...")
-    count = build_and_write_dataset(path)
-    print(f"System: Built base dataset with {count} rows.")
+def load_model(adapter_dir: Path):
+    if not adapter_dir.exists():
+        raise FileNotFoundError(
+            f"Adapter path not found: {adapter_dir}. Train once first."
+        )
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=str(adapter_dir),
+        max_seq_length=1024,
+        dtype=None,
+        load_in_4bit=True,
+    )
+    FastLanguageModel.for_inference(model)
+    return model, tokenizer
 
 
 def main() -> None:
     args = parse_args()
-    ensure_base_dataset(args.base_dataset)
+    if not args.base_dataset.exists():
+        raise FileNotFoundError(f"Base dataset not found: {args.base_dataset}")
 
-    client = OllamaClient(host=args.host, timeout=30)
-    client.ensure_running(auto_start=args.auto_start_ollama)
-
-    base_model = choose_supported_model(client)
-    unsloth_model = model_to_unsloth(base_model)
-    if unsloth_model is None:
-        raise RuntimeError("Selected model is unsupported for automatic retraining.")
-
-    model_state = ModelState(base_model)
-    store = MemoryStore(args.runtime_dir / "memory.db")
+    db_path = args.runtime_dir / "memory.db"
     interaction_log = args.runtime_dir / "interactions.jsonl"
     auto_dataset = args.runtime_dir / "auto_training_dataset.jsonl"
 
-    trainer = AutoTrainer(
-        client=client,
-        model_state=model_state,
+    store = MemoryStore(db_path=db_path)
+    trainer = SelfTrainer(
         python_exe=args.python_exe,
         train_script=args.train_script,
         base_dataset=args.base_dataset,
         auto_dataset=auto_dataset,
-        runtime_dir=args.runtime_dir,
         outputs_root=Path("outputs"),
-        base_ollama_model=base_model,
-        unsloth_model_name=unsloth_model,
-        setup_script=args.setup_script,
-        quantize=args.quantize,
-        eval_min_pass=args.eval_min_pass,
+        runtime_dir=args.runtime_dir,
         min_quality=args.min_quality,
         retrain_every=args.retrain_every,
         train_steps=args.train_steps,
@@ -859,26 +654,28 @@ def main() -> None:
     trainer.attach_store(store)
     trainer.start()
 
-    last_interaction_id: Optional[str] = None
-    last_seen_model, last_seen_version = model_state.get()
+    print("Loading production adapter...")
+    model, tokenizer = load_model(args.adapter_dir)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    seen_promotion_version = trainer.promotion_version
+
+    last_interaction_id: str | None = None
     print(
-        "\nOllama Autopilot ready.\n"
-        f"Live model: {last_seen_model}\n"
+        "\nSelf-learning PranavProfileGPT ready.\n"
         "Commands:\n"
         "  /approve-last  -> force-approve last response for training\n"
-        "  /bad-last      -> mark last response bad\n"
-        "  /stats         -> show counts\n"
-        "  /model         -> show current live model\n"
+        "  /bad-last      -> mark last response bad and exclude from training\n"
+        "  /stats         -> show memory and candidate stats\n"
+        "  /reload        -> reload current production adapter\n"
         "  exit           -> quit\n"
     )
 
     try:
         while True:
-            live_model, live_version = model_state.get()
-            if live_version != last_seen_version:
-                print(f"System: Switched live model to `{live_model}`.")
-                last_seen_model = live_model
-                last_seen_version = live_version
+            if trainer.promotion_version != seen_promotion_version:
+                model, tokenizer = load_model(args.adapter_dir)
+                seen_promotion_version = trainer.promotion_version
+                print("System: Auto-reloaded newly promoted model.")
 
             user_input = input("\nYou: ").strip()
             if not user_input:
@@ -890,7 +687,7 @@ def main() -> None:
                     print("System: Last interaction approved and promoted.")
                     trainer.notify_new_data()
                 else:
-                    print("System: No interaction to approve.")
+                    print("System: No interaction available to approve.")
                 continue
             if user_input == "/bad-last":
                 ok = store.mark_last_bad()
@@ -905,8 +702,9 @@ def main() -> None:
                     f"retrain_every={args.retrain_every}"
                 )
                 continue
-            if user_input == "/model":
-                print(f"System: live_model={live_model}")
+            if user_input == "/reload":
+                model, tokenizer = load_model(args.adapter_dir)
+                print("System: Reloaded production adapter.")
                 continue
 
             memory_rows = store.fetch_recent(limit=2000)
@@ -915,44 +713,44 @@ def main() -> None:
                 memory_rows=memory_rows,
                 top_k=args.memory_top_k,
             )
+
             prompt = PROMPT_TEMPLATE.format(
                 system_prompt=SYSTEM_PROMPT,
                 memory_block=memory_context,
                 user_input=user_input,
             )
-
-            try:
-                reply = client.generate(
-                    model=live_model,
-                    prompt=prompt,
-                    max_new_tokens=args.max_new_tokens,
-                    temperature=0.3,
-                    top_p=0.9,
-                )
-            except Exception as exc:  # noqa: BLE001
-                print(f"System: generation failed: {exc}")
-                continue
-
-            if not reply.strip():
+            inputs = tokenizer([prompt], return_tensors="pt").to(device)
+            output_tokens = model.generate(
+                **inputs,
+                max_new_tokens=args.max_new_tokens,
+                temperature=0.3,
+                top_p=0.9,
+                use_cache=True,
+            )
+            full_text = tokenizer.batch_decode(output_tokens)[0]
+            reply = full_text.split("### Response:")[-1].strip()
+            if "<|eot_id|>" in reply:
+                reply = reply.split("<|eot_id|>")[0].strip()
+            if not reply:
                 reply = "I do not have that detail in Pranav's saved profile yet."
+
             print(f"Model: {reply}")
 
             q_score = quality_heuristic(user_input=user_input, model_output=reply)
             approved = q_score >= args.min_quality
             interaction = Interaction(
                 uid=str(uuid.uuid4()),
-                ts=now_iso(),
+                ts=datetime.now(timezone.utc).isoformat(),
                 user_input=user_input,
                 model_output=reply,
                 memory_context=memory_context,
                 quality_score=q_score,
                 approved=approved,
-                source_model=live_model,
+                source_adapter=str(args.adapter_dir),
             )
             store.add_interaction(interaction)
             write_interaction_jsonl(interaction_log, interaction)
             last_interaction_id = interaction.uid
-
             if approved:
                 store.promote_interaction(interaction.uid)
                 trainer.notify_new_data()

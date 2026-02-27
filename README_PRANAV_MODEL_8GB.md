@@ -38,18 +38,20 @@ If Unsloth import issues appear, check the Known Issues section in `README.md` (
 .\.venv311\Scripts\python.exe scripts/train_pranav_8gb.py `
   --dataset-path data/pranav_profile_qa.jsonl `
   --output-dir outputs/pranav_8gb `
-  --model-name unsloth/Llama-3.2-1B-Instruct-bnb-4bit `
+  --model-name unsloth/Llama-3.2-3B-Instruct-bnb-4bit `
   --max-seq-length 1024 `
   --batch-size 1 `
   --grad-accum 8 `
-  --max-steps 250 `
-  --learning-rate 2e-4
+  --max-steps 0 `
+  --auto-max-steps `
+  --target-epochs 2.8 `
+  --min-steps 140 `
+  --max-steps-cap 450 `
+  --learning-rate 1.5e-4 `
+  --save-merged-16bit
 ```
 
-Recommended stronger run:
-
-- `--max-steps 600` for better memory of profile details.
-- Add `--save-merged-16bit` if you want to export directly to Ollama later.
+This uses auto step sizing so each run stays efficient while still training on enough data.
 
 ## 4) Chat with Your Model
 

@@ -45,10 +45,10 @@ ollama pull llama3.2:3b
 ## Defaults (safe)
 
 - Auto-retrain every `40` promoted interactions
-- Retrain steps per cycle: `100`
+- Retrain steps per cycle: `0` (auto-sized from dataset volume for efficiency)
 - Min quality for auto-promotion: `0.90`
 - Quantization for rollout model: `q4_K_M`
-- Eval gate: `2` checks minimum
+- Eval gate: `7` checks minimum (includes typo checks + strict `BTS7960` and `CPR = PPR x 4`)
 
 You can tune:
 
@@ -56,9 +56,9 @@ You can tune:
 .\.venv311\Scripts\python.exe scripts\ollama_autopilot.py `
   --auto-start-ollama `
   --retrain-every 50 `
-  --train-steps 120 `
+  --train-steps 0 `
   --min-quality 0.92 `
-  --eval-min-pass 3
+  --eval-min-pass 7
 ```
 
 ## Runtime Files

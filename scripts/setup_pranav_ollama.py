@@ -85,8 +85,8 @@ def write_modelfile(modelfile: Path, gguf_name: str) -> None:
             [
                 f"FROM ./{gguf_name}",
                 "",
-                "PARAMETER temperature 0.6",
-                "PARAMETER top_p 0.9",
+                "PARAMETER temperature 0.2",
+                "PARAMETER top_p 0.85",
                 "PARAMETER repeat_penalty 1.1",
                 "PARAMETER num_ctx 8192",
                 "",

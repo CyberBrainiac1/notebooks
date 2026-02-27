@@ -16,6 +16,7 @@ print("This takes ~2 minutes...")
 import subprocess
 import sys
 import os
+import math
 
 def install_packages():
     """Install required packages for Colab."""
@@ -87,22 +88,45 @@ tokenizer = get_chat_template(
     chat_template="llama-3.1",
 )
 
-# Check if dataset exists - try expanded first, then fallback
-dataset_file = "data/pranav_full_training.jsonl"
-if not os.path.exists(dataset_file):
-    dataset_file = "data/pranav_profile_qa.jsonl"
-    if not os.path.exists(dataset_file):
-        dataset_file = "pranav_profile_qa.jsonl"
-
-if not os.path.exists(dataset_file):
+# Check if dataset exists - prefer strongest enriched dataset first
+dataset_candidates = [
+    "data/pranav_profile_qa_v4.jsonl",
+    "data/pranav_full_training.jsonl",
+    "data/pranav_profile_qa_v2.jsonl",
+    "data/pranav_profile_qa.jsonl",
+    "pranav_profile_qa_v4.jsonl",
+    "pranav_profile_qa.jsonl",
+]
+dataset_file = next((p for p in dataset_candidates if os.path.exists(p)), None)
+if dataset_file is None:
     print("❌ ERROR: Dataset not found!")
     print("Please ensure one of these files exists:")
-    print("  - data/pranav_full_training.jsonl (preferred, includes your writings)")
-    print("  - data/pranav_profile_qa.jsonl (original profile Q&A)")
+    print("  - data/pranav_profile_qa_v4.jsonl (preferred, fact-locked)")
+    print("  - data/pranav_full_training.jsonl")
+    print("  - data/pranav_profile_qa.jsonl")
     sys.exit(1)
 
 dataset = load_dataset("json", data_files=dataset_file, split="train")
 print(f"✅ Loaded {len(dataset)} training examples from {dataset_file}")
+
+# Dedupe for better sample efficiency
+seen = set()
+keep = []
+for i, row in enumerate(dataset):
+    key = (
+        str(row["instruction"]).strip().lower(),
+        str(row["input"]).strip().lower(),
+        str(row["output"]).strip().lower(),
+    )
+    if key in seen:
+        continue
+    seen.add(key)
+    keep.append(i)
+if len(keep) != len(dataset):
+    removed = len(dataset) - len(keep)
+    dataset = dataset.select(keep)
+    print(f"✅ Deduplicated dataset, removed {removed} rows")
+print(f"✅ Effective training rows: {len(dataset)}")
 
 # Step 5: Format dataset
 print("\n🔄 Step 5: Formatting dataset...")
@@ -138,6 +162,12 @@ print("\n🏋️  Step 6: Setting up trainer...")
 from trl import SFTConfig, SFTTrainer
 from transformers import DataCollatorForSeq2Seq
 
+effective_batch = 2 * 4
+target_epochs = 2.8
+max_steps = max(140, min(460, math.ceil(len(dataset) * target_epochs / effective_batch)))
+warmup_steps = max(8, min(50, int(max_steps * 0.08)))
+print(f"⚙️ Auto training config -> max_steps={max_steps}, warmup_steps={warmup_steps}")
+
 trainer = SFTTrainer(
     model=model,
     tokenizer=tokenizer,
@@ -149,9 +179,9 @@ trainer = SFTTrainer(
     args=SFTConfig(
         per_device_train_batch_size=2,
         gradient_accumulation_steps=4,
-        warmup_steps=10,
-        max_steps=400,  # Increased from 300, with 273 examples: ~6 epochs
-        learning_rate=2e-4,
+        warmup_steps=warmup_steps,
+        max_steps=max_steps,
+        learning_rate=1.5e-4,
         logging_steps=10,
         optim="adamw_8bit",
         weight_decay=0.01,

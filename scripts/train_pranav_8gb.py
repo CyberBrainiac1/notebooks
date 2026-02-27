@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 from pathlib import Path
@@ -104,6 +105,29 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Also export a merged 16-bit model (larger disk usage).",
     )
+    parser.add_argument(
+        "--auto-max-steps",
+        action="store_true",
+        help="Automatically derive max-steps from dataset size and effective batch size.",
+    )
+    parser.add_argument(
+        "--target-epochs",
+        type=float,
+        default=3.0,
+        help="Approximate epochs used when --auto-max-steps is enabled.",
+    )
+    parser.add_argument(
+        "--min-steps",
+        type=int,
+        default=120,
+        help="Lower clamp for auto-derived max-steps.",
+    )
+    parser.add_argument(
+        "--max-steps-cap",
+        type=int,
+        default=700,
+        help="Upper clamp for auto-derived max-steps.",
+    )
     return parser.parse_args()
 
 
@@ -126,6 +150,34 @@ def format_dataset(raw_dataset, eos_token: str):
         return {"text": texts}
 
     return raw_dataset.map(_fmt, batched=True)
+
+
+def dedupe_dataset(dataset):
+    seen: set[tuple[str, str, str]] = set()
+    keep: list[int] = []
+    for idx, row in enumerate(dataset):
+        key = (
+            str(row["instruction"]).strip().lower(),
+            str(row["input"]).strip().lower(),
+            str(row["output"]).strip().lower(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        keep.append(idx)
+    if len(keep) == len(dataset):
+        return dataset, 0
+    deduped = dataset.select(keep)
+    return deduped, len(dataset) - len(keep)
+
+
+def resolve_max_steps(args: argparse.Namespace, row_count: int) -> tuple[int, bool]:
+    if args.auto_max_steps or args.max_steps <= 0:
+        effective_batch = max(1, args.batch_size * args.grad_accum)
+        derived = math.ceil((row_count * max(0.5, args.target_epochs)) / effective_batch)
+        steps = max(args.min_steps, min(args.max_steps_cap, derived))
+        return steps, True
+    return args.max_steps, False
 
 
 def main() -> None:
@@ -164,6 +216,17 @@ def main() -> None:
 
     print("Loading and formatting dataset...")
     dataset = load_dataset("json", data_files=str(args.dataset_path), split="train")
+    dataset, removed = dedupe_dataset(dataset)
+    if removed:
+        print(f"Deduplicated dataset: removed {removed} duplicate rows.")
+    row_count = len(dataset)
+    max_steps, auto_used = resolve_max_steps(args, row_count)
+    warmup_steps = max(5, min(50, int(max_steps * 0.08)))
+    print(
+        "Training config:",
+        f"rows={row_count}, max_steps={max_steps}",
+        f"(auto={auto_used}), batch={args.batch_size}, grad_accum={args.grad_accum}",
+    )
     dataset = format_dataset(dataset, tokenizer.eos_token)
 
     bf16_supported = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
@@ -179,8 +242,8 @@ def main() -> None:
             output_dir=str(args.output_dir / "checkpoints"),
             per_device_train_batch_size=args.batch_size,
             gradient_accumulation_steps=args.grad_accum,
-            warmup_steps=10,
-            max_steps=args.max_steps,
+            warmup_steps=warmup_steps,
+            max_steps=max_steps,
             learning_rate=args.learning_rate,
             logging_steps=5,
             optim="adamw_8bit",

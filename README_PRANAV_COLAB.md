@@ -21,6 +21,97 @@ This notebook fine-tunes **Llama 3.2 3B** on your personal information to create
 
 ## 📋 Quick Start
 
+### Copy-Paste Colab Commands (No Laptop GPU)
+
+Run these in a fresh Colab notebook with `Runtime -> Change runtime type -> T4 GPU`.
+
+Fastest path (single training command after clone):
+
+```python
+!python scripts/colab_run_all.py --build-gguf --download-gguf
+```
+
+If you want full explicit cells instead, use the blocks below.
+
+```python
+# Cell 1: Clone your repo
+!git clone https://github.com/<YOUR_USERNAME>/<YOUR_REPO>.git
+%cd /content/<YOUR_REPO>
+```
+
+```python
+# Cell 2: Install deps
+!pip install -q --upgrade pip
+!pip install -q transformers==4.56.2 datasets==4.3.0
+!pip install -q --no-deps trl peft accelerate bitsandbytes
+!pip install -q unsloth==2026.2.1 unsloth-zoo==2026.2.1 sentencepiece protobuf huggingface_hub hf_transfer
+```
+
+```python
+# Cell 3: Build enriched dataset (fact locks + typo hard-cases)
+!python scripts/build_pranav_profile_dataset.py --output data/pranav_profile_qa_v2.jsonl
+!python scripts/build_pranav_booster_dataset.py --input data/pranav_profile_qa_v2.jsonl --output data/pranav_profile_qa_v4.jsonl --repeat-scale 1
+```
+
+```python
+# Cell 4: Efficient 3B training (auto-sized steps)
+!python scripts/train_pranav_8gb.py \
+  --dataset-path data/pranav_profile_qa_v4.jsonl \
+  --output-dir outputs/pranav_colab_3b \
+  --model-name unsloth/Llama-3.2-3B-Instruct-bnb-4bit \
+  --batch-size 1 \
+  --grad-accum 8 \
+  --max-seq-length 1024 \
+  --max-steps 0 \
+  --auto-max-steps \
+  --target-epochs 2.8 \
+  --min-steps 160 \
+  --max-steps-cap 460 \
+  --learning-rate 1.5e-4 \
+  --save-merged-16bit
+```
+
+Or run everything from one script:
+
+```python
+!python scripts/colab_run_all.py \
+  --build-gguf \
+  --download-gguf
+```
+
+```python
+# Cell 5: Convert merged model to GGUF for Ollama import later
+!git clone --depth 1 https://github.com/ggml-org/llama.cpp /content/llama.cpp
+!python /content/llama.cpp/convert_hf_to_gguf.py \
+  outputs/pranav_colab_3b/pranav_merged_16bit \
+  --outfile outputs/pranav_colab_3b/pranav-assistant-f16.gguf \
+  --outtype f16
+```
+
+```python
+# Cell 6: Download GGUF
+from google.colab import files
+files.download("outputs/pranav_colab_3b/pranav-assistant-f16.gguf")
+```
+
+On your laptop (no local training), import to Ollama:
+
+```bash
+cat > Modelfile << 'EOF'
+FROM ./pranav-assistant-f16.gguf
+PARAMETER temperature 0.2
+PARAMETER top_p 0.85
+PARAMETER repeat_penalty 1.1
+PARAMETER num_ctx 8192
+SYSTEM """You are Pranav's personal robotics and engineering assistant.
+- Use only known profile facts; if unknown, say you do not have that detail yet.
+- Keep answers practical and concise."""
+EOF
+
+ollama create pranav-assistant-pro -f Modelfile --quantize q4_K_M
+ollama run pranav-assistant-pro
+```
+
 ### 1. Open the Notebook in Google Colab
 
 Click this button to open directly in Colab:
