@@ -8,6 +8,9 @@ It works by:
 2. Vectorizing memories with an embedding model.
 3. Retrieving the most relevant memories each turn.
 4. Auto-saving good new interactions as fresh memories.
+5. Routing automatically:
+   - profile/project questions use memory-grounded answers
+   - general/random questions get direct clear answers
 
 ## One-Time Setup
 

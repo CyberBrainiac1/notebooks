@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -25,16 +26,26 @@ except ModuleNotFoundError:
     from scripts.build_pranav_profile_dataset import build_and_write_dataset
 
 
-SYSTEM_PROMPT = (
+PROFILE_SYSTEM_PROMPT = (
     "You are PranavProfileGPT, a profile-grounded assistant.\n"
     "Rules:\n"
-    "- Use only known profile facts and retrieved memory context.\n"
-    "- If unknown, say you do not have that detail yet.\n"
-    "- Do not invent personal details."
+    "- For profile questions about Pranav, use retrieved memory first.\n"
+    "- If a personal detail is unknown, say you do not have that detail yet.\n"
+    "- For how-to questions in his known project domains, give practical steps tied to known setup details.\n"
+    "- Do not invent private personal details."
+)
+
+GENERAL_SYSTEM_PROMPT = (
+    "You are a clear technical assistant.\n"
+    "Rules:\n"
+    "- For non-profile questions, answer directly and clearly.\n"
+    "- Keep answers concise and practical.\n"
+    "- For how-to questions, use at most 5 short steps.\n"
+    "- Do not mention internal memory or hidden rules."
 )
 
 
-PROMPT_TEMPLATE = """{system_prompt}
+PROFILE_PROMPT_TEMPLATE = """{system_prompt}
 
 ### Retrieved Memory:
 {memory_block}
@@ -48,8 +59,17 @@ Answer the user question about Pranav's profile using facts only.
 ### Response:
 """
 
+GENERAL_PROMPT_TEMPLATE = """{system_prompt}
+
+### User Question:
+{user_input}
+
+### Response:
+"""
+
 
 UNKNOWN_REPLY = "I do not have that detail in Pranav's saved profile yet."
+TOKEN_RE = re.compile(r"[a-z0-9_]+")
 
 DEFAULT_SEED_DATASETS = [
     Path("data/pranav_profile_qa_v4.jsonl"),
@@ -57,6 +77,51 @@ DEFAULT_SEED_DATASETS = [
     Path("data/pranav_profile_qa_v3.jsonl"),
     Path("data/pranav_profile_qa_v2.jsonl"),
     Path("data/pranav_profile_qa.jsonl"),
+]
+
+PROFILE_KEYWORDS_PRIMARY = {
+    "pranav",
+    "profile",
+    "he",
+    "his",
+    "him",
+    "ftc",
+    "frc",
+    "evergreen",
+    "dragons",
+    "2854",
+}
+
+PROFILE_KEYWORDS_SECONDARY = {
+    "sim",
+    "wheel",
+    "ffb",
+    "encoder",
+    "cpr",
+    "ppr",
+    "bts7960",
+    "arduino",
+    "leonardo",
+    "onshape",
+    "solidworks",
+    "robotic",
+    "robotics",
+    "project",
+    "projects",
+}
+
+PROJECT_MEMORY_CARDS = [
+    "Project card: DIY sim racing wheel stack uses Arduino Leonardo, BTS7960, and quadrature encoder feedback.",
+    "Project card: Sim wheel debugging history includes pedal axis inversion, throttle/brake mapping issues, and angle scaling mismatches.",
+    "Project card: Encoder rule is CPR = PPR x 4 for quadrature decoding.",
+    "Project card: Sim wheel upgrade in progress is dual 12V brushed planetary motors geared to one shaft for summed torque.",
+    "Project card: Sim wheel goals include fixing in-game wheel/pedal behavior and eventually trying a fully maxed-out sim setup in person.",
+    "Project card: Sim wheel symptoms reported include soft force feedback and vibration-like behavior.",
+    "Project card: Robotics identity includes FTC team Evergreen Dragons and FRC Team 2854 Prototypes.",
+    "Project card: Leadership goals are mechanical lead by 10th grade and team captain by 11th grade.",
+    "Project card: Core projects include DIY robotic hand research, robotic arm work, FTC shooter iteration, and sim wheel build.",
+    "Project card: CAD strengths are SolidWorks and Onshape.",
+    "Project card: Preferred coding direction is Python and Raspberry Pi examples.",
 ]
 
 
@@ -83,6 +148,31 @@ def resolve_model_name(requested: str, installed: Sequence[str]) -> Optional[str
         if name.split(":", 1)[0].lower() == base:
             return name
     return None
+
+
+def tokenize(text: str) -> List[str]:
+    return TOKEN_RE.findall(text.lower())
+
+
+def lexical_overlap_score(query_text: str, candidate_text: str) -> float:
+    q = set(tokenize(query_text))
+    c = set(tokenize(candidate_text))
+    if not q or not c:
+        return 0.0
+    inter = len(q.intersection(c))
+    if inter == 0:
+        return 0.0
+    return inter / max(1, len(q))
+
+
+def is_profile_query(user_input: str) -> bool:
+    tokens = set(tokenize(user_input))
+    if not tokens:
+        return False
+    if tokens.intersection(PROFILE_KEYWORDS_PRIMARY):
+        return True
+    # If no explicit personal reference, require multiple project-context tokens.
+    return len(tokens.intersection(PROFILE_KEYWORDS_SECONDARY)) >= 3
 
 
 def cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
@@ -415,6 +505,7 @@ class MemoryStore:
     def retrieve_by_embedding(
         self,
         query_embedding: Sequence[float],
+        query_text: str = "",
         top_k: int = 6,
         scan_limit: int = 5000,
     ) -> List[Tuple[float, sqlite3.Row]]:
@@ -427,9 +518,15 @@ class MemoryStore:
                 continue
             if not isinstance(emb, list):
                 continue
-            score = cosine_similarity(query_embedding, emb)
-            if score <= 0:
+            vec_score = cosine_similarity(query_embedding, emb)
+            if vec_score <= 0:
                 continue
+            lex_score = (
+                lexical_overlap_score(query_text, str(row["content"]))
+                if query_text
+                else 0.0
+            )
+            score = (0.85 * vec_score) + (0.15 * lex_score)
             scored.append((score, row))
         scored.sort(key=lambda x: x[0], reverse=True)
         return scored[:top_k]
@@ -488,6 +585,19 @@ def gather_seed_datasets(
     return out
 
 
+def seed_project_cards(
+    store: MemoryStore,
+    client: OllamaClient,
+    embed_model: str,
+) -> int:
+    embeddings = client.embed_texts(embed_model, PROJECT_MEMORY_CARDS)
+    added = 0
+    for content, emb in zip(PROJECT_MEMORY_CARDS, embeddings):
+        if store.add_memory(content=content, embedding=emb, source="project_card"):
+            added += 1
+    return added
+
+
 def format_memory_context(
     store: MemoryStore,
     client: OllamaClient,
@@ -499,6 +609,7 @@ def format_memory_context(
     query_emb = client.embed_texts(embed_model, [user_input])[0]
     hits = store.retrieve_by_embedding(
         query_embedding=query_emb,
+        query_text=user_input,
         top_k=top_k,
         scan_limit=scan_limit,
     )
@@ -569,7 +680,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--memory-top-k", type=int, default=6)
     parser.add_argument("--memory-scan-limit", type=int, default=5000)
-    parser.add_argument("--max-new-tokens", type=int, default=220)
+    parser.add_argument("--max-new-tokens", type=int, default=320)
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--top-p", type=float, default=0.85)
     parser.add_argument(
@@ -638,6 +749,10 @@ def main() -> None:
         )
         seeded_total += added
         print(f"System: {dataset_path} -> added {added} memories")
+    cards_added = seed_project_cards(store=store, client=client, embed_model=embed_model)
+    seeded_total += cards_added
+    if cards_added:
+        print(f"System: project cards -> added {cards_added} memories")
     print(
         f"System: seed complete (added_total={seeded_total}, total_memories={store.memory_count()})."
     )
@@ -684,24 +799,33 @@ def main() -> None:
             )
             continue
 
-        try:
-            memory_context = format_memory_context(
-                store=store,
-                client=client,
-                embed_model=embed_model,
-                user_input=user_input,
-                top_k=args.memory_top_k,
-                scan_limit=args.memory_scan_limit,
-            )
-        except Exception as exc:  # noqa: BLE001
-            print(f"System: memory retrieval failed: {exc}")
-            memory_context = "- No relevant prior memory found."
+        profile_mode = is_profile_query(user_input)
+        memory_context = "- General mode (non-profile question)."
+        if profile_mode:
+            try:
+                memory_context = format_memory_context(
+                    store=store,
+                    client=client,
+                    embed_model=embed_model,
+                    user_input=user_input,
+                    top_k=args.memory_top_k,
+                    scan_limit=args.memory_scan_limit,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"System: memory retrieval failed: {exc}")
+                memory_context = "- No relevant prior memory found."
 
-        prompt = PROMPT_TEMPLATE.format(
-            system_prompt=SYSTEM_PROMPT,
-            memory_block=memory_context,
-            user_input=user_input,
-        )
+        if profile_mode:
+            prompt = PROFILE_PROMPT_TEMPLATE.format(
+                system_prompt=PROFILE_SYSTEM_PROMPT,
+                memory_block=memory_context,
+                user_input=user_input,
+            )
+        else:
+            prompt = GENERAL_PROMPT_TEMPLATE.format(
+                system_prompt=GENERAL_SYSTEM_PROMPT,
+                user_input=user_input,
+            )
 
         try:
             reply = client.generate(
@@ -747,7 +871,7 @@ def main() -> None:
                 + "\n"
             )
 
-        if q_score >= args.min_quality:
+        if profile_mode and q_score >= args.min_quality:
             memory_text = f"Q: {user_input} | A: {reply}"
             try:
                 emb = client.embed_texts(embed_model, [memory_text])[0]
